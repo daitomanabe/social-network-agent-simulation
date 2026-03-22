@@ -78,10 +78,12 @@ src/
 │   └── memory.py          # Agent memory management
 ├── network/
 │   ├── models.py          # Post, Relationship
-│   └── graph.py           # Watts-Strogatz small-world network
+│   ├── graph.py           # Watts-Strogatz small-world network
+│   └── dynamics.py        # Echo chamber detection, polarization metrics
 ├── news/
 │   ├── models.py          # NewsItem, TopicSeed
-│   └── ingestion.py       # RSS feed + manual injection
+│   ├── ingestion.py       # RSS feed + manual injection
+│   └── scheduler.py       # Automated news polling
 ├── timeline/
 │   ├── models.py          # Timeline, ForkPoint, Snapshot
 │   ├── manager.py         # Snapshot/fork/comparison management
@@ -89,8 +91,9 @@ src/
 │   └── reality_diff.py    # Prediction vs reality comparison
 └── visualization/
     ├── cli.py             # Rich CLI dashboard
-    ├── api.py             # FastAPI REST + WebSocket
-    └── server.py          # Uvicorn startup
+    ├── api.py             # FastAPI REST + WebSocket (19 endpoints)
+    ├── server.py          # Uvicorn startup
+    └── static/index.html  # D3.js web dashboard
 ```
 
 ## Key Features
@@ -108,10 +111,12 @@ src/
 | Timeline forking (parallel worlds) | ✅ |
 | Reality Diff (prediction accuracy) | ✅ |
 | Rich CLI dashboard | ✅ |
-| FastAPI + WebSocket API | ✅ |
-| Web visualization (D3.js) | 🔜 |
-| Automated news scheduling | 🔜 |
-| Echo chamber detection | 🔜 |
+| FastAPI + WebSocket API (19 endpoints) | ✅ |
+| D3.js web dashboard (network graph, real-time) | ✅ |
+| Automated news scheduling (RSS polling) | ✅ |
+| Echo chamber detection + polarization metrics | ✅ |
+| Network evolution (homophily rewiring) | ✅ |
+| Advanced memory (reflections, weighted retrieval) | ✅ |
 
 ## Tech Stack
 
