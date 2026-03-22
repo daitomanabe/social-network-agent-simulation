@@ -9,7 +9,7 @@ from datetime import datetime
 
 from src.agents.behavior import RuleBasedBehavior, ActionType
 from src.agents.factory import AgentFactory
-from src.agents.memory import MemoryManager
+from src.agents.memory import MemoryManager, MemoryStream, generate_reflection_simple
 from src.agents.models import AgentProfile, AgentState
 from src.core.config import SimulationConfig
 from src.core.database import Database
@@ -50,6 +50,12 @@ class SimulationEngine:
         # LLM brain (lazy-initialized)
         self._llm_brain = None
 
+        # Network dynamics (lazy-initialized)
+        self._dynamics = None
+
+        # Memory streams for advanced memory (agent_id -> MemoryStream)
+        self.memory_streams: dict[str, MemoryStream] = {}
+
         self.profiles: dict[str, AgentProfile] = {}
         self.states: dict[str, AgentState] = {}
         self.topic_id: str = ""      # Primary topic (backwards compat)
@@ -62,6 +68,20 @@ class SimulationEngine:
         self._on_step_complete: list = []
 
         self._initialized = False
+
+        # Feature flags
+        self.enable_network_evolution: bool = False
+        self.enable_reflections: bool = True
+        self.network_evolve_interval: int = 5   # Every N steps
+        self.reflection_interval: int = 10       # Every N steps
+
+    @property
+    def dynamics(self):
+        """Lazy-init network dynamics."""
+        if self._dynamics is None:
+            from src.network.dynamics import NetworkDynamics
+            self._dynamics = NetworkDynamics(self.graph)
+        return self._dynamics
 
     @property
     def llm_brain(self):
@@ -104,6 +124,10 @@ class SimulationEngine:
             p=self.config.network_p,
             seed=self.config.seed,
         )
+
+        # Initialize memory streams
+        for aid in self.profiles:
+            self.memory_streams[aid] = MemoryStream(reflection_interval=self.reflection_interval)
 
         # Persist initial state
         self.db.insert_agents_batch(profiles_list)
@@ -174,6 +198,18 @@ class SimulationEngine:
         if step_num % 5 == 0:
             self.db.save_agent_states_batch(list(self.states.values()), step=step_num)
 
+        # Network evolution (homophily rewiring + edge strengthening)
+        network_changes = {}
+        if self.enable_network_evolution and step_num % self.network_evolve_interval == 0:
+            network_changes = self.dynamics.evolve_network(
+                self.states, self.topic_id, seed=step_num,
+            )
+
+        # Agent reflections
+        reflections_generated = 0
+        if self.enable_reflections and step_num % self.reflection_interval == 0:
+            reflections_generated = self._run_reflections(step_num)
+
         # Compute stats
         all_opinions = [
             s.opinions.get(self.topic_id, 0.0) for s in self.states.values()
@@ -192,6 +228,8 @@ class SimulationEngine:
             "avg_shift": sum(opinion_shifts) / len(opinion_shifts) if opinion_shifts else 0,
             "total_posts": sum(s.post_count + s.reply_count for s in self.states.values()),
             "llm_calls": llm_calls,
+            "network_changes": network_changes,
+            "reflections_generated": reflections_generated,
         }
         self.step_stats.append(stats)
 
@@ -297,6 +335,30 @@ class SimulationEngine:
 
         if action.memory_entry:
             state.memory = self.memory_mgr.add(state.memory, action.memory_entry)
+            # Also add to structured memory stream
+            if agent_id in self.memory_streams:
+                importance = 0.7 if action.action_type != ActionType.IDLE else 0.3
+                topic = ""
+                if action.post:
+                    topic = action.post.topic_id
+                self.memory_streams[agent_id].add_observation(
+                    action.memory_entry, step_num, topic_id=topic, importance=importance,
+                )
+
+    def _run_reflections(self, step_num: int) -> int:
+        """Generate reflections for agents whose memory streams are due."""
+        count = 0
+        for aid, stream in self.memory_streams.items():
+            if stream.should_reflect and len(stream.observations) >= 5:
+                reflections = generate_reflection_simple(stream.observations)
+                for r in reflections:
+                    stream.add_reflection(r, step=step_num, topic_id=self.topic_id)
+                    # Also add to legacy memory for backwards compat
+                    self.states[aid].memory = self.memory_mgr.add(
+                        self.states[aid].memory, f"[リフレクション] {r}"
+                    )
+                count += len(reflections)
+        return count
 
     def run(self, n_steps: int) -> list[dict]:
         """Run N simulation steps."""
