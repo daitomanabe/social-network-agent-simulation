@@ -60,8 +60,7 @@ class Database:
                 sentiment REAL DEFAULT 0.0,
                 is_news_seed INTEGER DEFAULT 0,
                 reply_to TEXT,
-                reactions_json TEXT DEFAULT '{}',
-                FOREIGN KEY (author_id) REFERENCES agents(id)
+                reactions_json TEXT DEFAULT '{}'
             );
 
             CREATE TABLE IF NOT EXISTS simulation_state (
