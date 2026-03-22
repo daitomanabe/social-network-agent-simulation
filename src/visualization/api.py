@@ -314,6 +314,161 @@ def get_stats():
     return {"stats": engine.step_stats[-50:]}  # Last 50 steps
 
 
+@app.get("/api/polarization")
+def get_polarization(topic_id: str | None = None):
+    """Get polarization analysis and echo chamber detection."""
+    engine = _get_engine()
+    tid = topic_id or engine.topic_id
+
+    pol = engine.dynamics.compute_polarization(engine.states, tid)
+    chambers = engine.dynamics.detect_echo_chambers(engine.states, tid)
+
+    return {
+        "topic": tid,
+        "polarization": {
+            "index": pol.polarization_index,
+            "bimodality": pol.bimodality_coefficient,
+            "modularity": pol.modularity,
+            "kurtosis": pol.opinion_kurtosis,
+            "cross_cluster_edges": pol.cross_cluster_edges_ratio,
+        },
+        "echo_chambers": [
+            {
+                "id": ch.id,
+                "size": ch.size,
+                "mean_opinion": ch.mean_opinion,
+                "opinion_std": ch.opinion_std,
+                "density": ch.internal_density,
+                "label": ch.label,
+                "agent_ids": ch.agent_ids[:10],  # Limit for response size
+            }
+            for ch in chambers
+        ],
+        "chamber_count": len(chambers),
+        "severity": (
+            "high" if pol.polarization_index > 0.7
+            else "moderate" if pol.polarization_index > 0.4
+            else "low"
+        ),
+    }
+
+
+@app.get("/api/network/graph")
+def get_network_graph():
+    """Export the network graph in D3.js-compatible format.
+
+    Returns nodes with agent data and links with weights.
+    """
+    engine = _get_engine()
+    G = engine.graph.graph
+
+    nodes = []
+    for node_id in G.nodes():
+        profile = engine.profiles.get(node_id)
+        state = engine.states.get(node_id)
+        if not profile or not state:
+            continue
+        opinion = state.opinions.get(engine.topic_id, 0.0)
+        nodes.append({
+            "id": node_id,
+            "name": profile.name,
+            "group": _opinion_group(opinion),
+            "opinion": round(opinion, 3),
+            "extraversion": round(profile.personality.extraversion, 2),
+            "post_count": state.post_count + state.reply_count,
+            "age_group": profile.age_group,
+            "occupation": profile.occupation,
+        })
+
+    links = []
+    for u, v, data in G.edges(data=True):
+        links.append({
+            "source": u,
+            "target": v,
+            "weight": round(data.get("weight", 0.5), 3),
+            "interactions": data.get("interaction_count", 0),
+        })
+
+    return {
+        "nodes": nodes,
+        "links": links,
+        "stats": engine.graph.stats,
+    }
+
+
+@app.get("/api/network/communities")
+def get_communities():
+    """Get community structure of the network."""
+    engine = _get_engine()
+    chambers = engine.dynamics.detect_echo_chambers(engine.states, engine.topic_id)
+
+    communities = {}
+    for ch in chambers:
+        communities[ch.id] = {
+            "agent_ids": ch.agent_ids,
+            "size": ch.size,
+            "mean_opinion": ch.mean_opinion,
+            "label": ch.label,
+            "density": ch.internal_density,
+        }
+
+    return {"communities": communities, "count": len(communities)}
+
+
+@app.get("/api/memory/{agent_id}")
+def get_agent_memory(agent_id: str, n: int = 10):
+    """Get an agent's memory stream with reflections."""
+    engine = _get_engine()
+    if agent_id not in engine.memory_streams:
+        return {"error": "Agent not found"}
+
+    stream = engine.memory_streams[agent_id]
+    retrieved = stream.retrieve(engine.time.step, engine.topic_id, n=n)
+
+    return {
+        "agent_id": agent_id,
+        "total_items": len(stream.items),
+        "observations": len(stream.observations),
+        "reflections_count": len(stream.reflections),
+        "memories": [
+            {
+                "content": item.content,
+                "step": item.step,
+                "importance": item.importance,
+                "is_reflection": item.is_reflection,
+                "topic": item.topic_id,
+            }
+            for item in retrieved
+        ],
+        "all_reflections": [
+            {"content": r.content, "step": r.step}
+            for r in stream.reflections
+        ],
+    }
+
+
+@app.post("/api/simulation/evolve")
+def evolve_network():
+    """Trigger one round of network evolution."""
+    engine = _get_engine()
+    changes = engine.dynamics.evolve_network(engine.states, engine.topic_id, seed=engine.time.step)
+    return {"changes": changes}
+
+
+def _opinion_group(opinion: float) -> int:
+    """Map opinion to a group index for visualization coloring."""
+    if opinion < -0.6:
+        return 0  # strong against
+    elif opinion < -0.2:
+        return 1  # against
+    elif opinion < 0.2:
+        return 2  # neutral
+    elif opinion < 0.6:
+        return 3  # for
+    else:
+        return 4  # strong for
+
+
 # --- WebSocket ---
 
 
