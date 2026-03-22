@@ -52,7 +52,8 @@ class SimulationEngine:
 
         self.profiles: dict[str, AgentProfile] = {}
         self.states: dict[str, AgentState] = {}
-        self.topic_id: str = ""
+        self.topic_id: str = ""      # Primary topic (backwards compat)
+        self.topic_ids: list[str] = []  # All active topics
 
         # Stats per step
         self.step_stats: list[dict] = []
@@ -81,13 +82,14 @@ class SimulationEngine:
     def initialize(self) -> None:
         """Set up agents, network, and initial state."""
         topic_names = self.config.initial_topics
-        self.topic_id = topic_names[0].lower().replace(" ", "_")
+        self.topic_ids = [t.lower().replace(" ", "_") for t in topic_names]
+        self.topic_id = self.topic_ids[0]  # Primary topic for backwards compat
 
         # Generate population
         agents = AgentFactory.generate_population(
             n=self.config.agent_count,
             seed=self.config.seed,
-            initial_topics=[self.topic_id],
+            initial_topics=self.topic_ids,
         )
 
         for profile, state in agents:
@@ -151,8 +153,12 @@ class SimulationEngine:
             state = self.states[agent_id]
             feed = self.graph.get_feed(agent_id, step_num)
 
+            # Pick topic: agent discusses the topic they have strongest opinion on,
+            # or the one with most feed activity
+            topic = self._pick_topic(agent_id, feed, rng)
+
             action = self.behavior.decide_action(
-                profile, state, feed, self.topic_id, step_num,
+                profile, state, feed, topic, step_num,
                 sim_time_str=self.time.sim_date_str,
             )
             self._apply_action(
@@ -300,11 +306,44 @@ class SimulationEngine:
             results.append(stats)
         return results
 
-    def inject_news(self, headline: str, summary: str, sentiment: float = 0.0) -> Post:
+    def _pick_topic(self, agent_id: str, feed: list[Post], rng: random.Random) -> str:
+        """Pick which topic an agent discusses this step."""
+        if len(self.topic_ids) == 1:
+            return self.topic_ids[0]
+
+        state = self.states[agent_id]
+
+        # Weight by: opinion strength (agents care more about strong opinions)
+        # + feed activity (topics with more posts in feed)
+        topic_scores: dict[str, float] = {}
+        for tid in self.topic_ids:
+            opinion_strength = abs(state.opinions.get(tid, 0.0))
+            feed_count = sum(1 for p in feed if p.topic_id == tid)
+            topic_scores[tid] = opinion_strength * 0.6 + feed_count * 0.3 + 0.1  # Floor
+
+        topics = list(topic_scores.keys())
+        weights = [topic_scores[t] for t in topics]
+        return rng.choices(topics, weights=weights, k=1)[0]
+
+    def add_topic(self, topic_name: str) -> str:
+        """Add a new discussion topic to the simulation."""
+        topic_id = topic_name.lower().replace(" ", "_")
+        if topic_id not in self.topic_ids:
+            self.topic_ids.append(topic_id)
+            # Initialize opinions for all agents
+            rng = random.Random(hash(topic_id))
+            for state in self.states.values():
+                profile = self.profiles[state.agent_id]
+                base = (profile.personality.openness - 0.5) * 0.4
+                state.opinions[topic_id] = max(-1.0, min(1.0, base + rng.gauss(0, 0.25)))
+        return topic_id
+
+    def inject_news(self, headline: str, summary: str, sentiment: float = 0.0, topic_id: str | None = None) -> Post:
         """Inject a news item as a seed post."""
+        target_topic = topic_id or self.topic_id
         post = Post(
             author_id="NEWS",
-            topic_id=self.topic_id,
+            topic_id=target_topic,
             content=f"📰 {headline}\n{summary}",
             step=self.time.step + 1,
             sim_time=self.time.current,
@@ -319,7 +358,7 @@ class SimulationEngine:
         """Register a callback for step completion."""
         self._on_step_complete.append(callback)
 
-    def get_opinion_distribution(self) -> dict:
+    def get_opinion_distribution(self, topic_id: str | None = None) -> dict:
         """Get current opinion distribution in buckets."""
         buckets = {
             "strong_against (-1.0 ~ -0.6)": 0,
@@ -328,8 +367,9 @@ class SimulationEngine:
             "for (0.2 ~ 0.6)": 0,
             "strong_for (0.6 ~ 1.0)": 0,
         }
+        tid = topic_id or self.topic_id
         for state in self.states.values():
-            op = state.opinions.get(self.topic_id, 0.0)
+            op = state.opinions.get(tid, 0.0)
             if op < -0.6:
                 buckets["strong_against (-1.0 ~ -0.6)"] += 1
             elif op < -0.2:
