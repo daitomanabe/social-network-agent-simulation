@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import random
 from datetime import datetime
 
@@ -15,9 +17,16 @@ from src.core.time_manager import TimeManager
 from src.network.graph import SocialGraph
 from src.network.models import Post
 
+logger = logging.getLogger(__name__)
+
 
 class SimulationEngine:
-    """Orchestrates the simulation loop."""
+    """Orchestrates the simulation loop.
+
+    Supports two modes:
+    - Rule-based (default): fast, no API costs, good for prototyping
+    - Hybrid (use_llm=True): top agents use Claude API, rest use rules
+    """
 
     def __init__(
         self,
@@ -38,6 +47,9 @@ class SimulationEngine:
         self.behavior = RuleBasedBehavior(seed=self.config.seed)
         self.memory_mgr = MemoryManager()
 
+        # LLM brain (lazy-initialized)
+        self._llm_brain = None
+
         self.profiles: dict[str, AgentProfile] = {}
         self.states: dict[str, AgentState] = {}
         self.topic_id: str = ""
@@ -49,6 +61,22 @@ class SimulationEngine:
         self._on_step_complete: list = []
 
         self._initialized = False
+
+    @property
+    def llm_brain(self):
+        """Lazy-init LLM brain only when needed."""
+        if self._llm_brain is None:
+            from src.agents.llm_brain import LLMBrain
+            from src.core.llm_client import LLMClient
+            client = LLMClient(
+                model=self.config.llm.model,
+                max_tokens=self.config.llm.max_tokens,
+                temperature=self.config.llm.temperature,
+                max_concurrent=self.config.llm.max_concurrent_calls,
+                cost_limit_usd=self.config.llm.cost_limit_daily_usd,
+            )
+            self._llm_brain = LLMBrain(client)
+        return self._llm_brain
 
     def initialize(self) -> None:
         """Set up agents, network, and initial state."""
@@ -96,47 +124,41 @@ class SimulationEngine:
         n_active = max(1, int(len(all_ids) * self.config.activity_rate))
         active_ids = rng.sample(all_ids, n_active)
 
+        # Split into LLM and rule-based agents
+        if self.config.use_llm:
+            llm_ids, rule_ids = self._split_by_priority(active_ids)
+        else:
+            llm_ids, rule_ids = [], active_ids
+
         posts_this_step: list[Post] = []
         actions_taken = {"idle": 0, "post": 0, "reply": 0}
         opinion_shifts: list[float] = []
+        llm_calls = 0
 
-        for agent_id in active_ids:
+        # Process LLM agents (async batch)
+        if llm_ids:
+            llm_actions = self._run_llm_batch(llm_ids, step_num)
+            llm_calls = len(llm_ids)
+            for agent_id, action in zip(llm_ids, llm_actions):
+                self._apply_action(
+                    agent_id, action, step_num, posts_this_step,
+                    actions_taken, opinion_shifts,
+                )
+
+        # Process rule-based agents
+        for agent_id in rule_ids:
             profile = self.profiles[agent_id]
             state = self.states[agent_id]
-
-            # Get feed
             feed = self.graph.get_feed(agent_id, step_num)
 
-            # Decide action
             action = self.behavior.decide_action(
                 profile, state, feed, self.topic_id, step_num,
                 sim_time_str=self.time.sim_date_str,
             )
-
-            actions_taken[action.action_type.value] += 1
-
-            # Apply action
-            if action.post is not None:
-                action.post.sim_time = self.time.current
-                self.graph.add_post(action.post)
-                posts_this_step.append(action.post)
-
-                if action.action_type == ActionType.POST:
-                    state.post_count += 1
-                else:
-                    state.reply_count += 1
-
-            # Apply opinion shifts
-            if action.opinion_deltas:
-                for topic, delta in action.opinion_deltas.items():
-                    old = state.opinions.get(topic, 0.0)
-                    new = max(-1.0, min(1.0, old + delta))
-                    state.opinions[topic] = new
-                    opinion_shifts.append(abs(delta))
-
-            # Update memory
-            if action.memory_entry:
-                state.memory = self.memory_mgr.add(state.memory, action.memory_entry)
+            self._apply_action(
+                agent_id, action, step_num, posts_this_step,
+                actions_taken, opinion_shifts,
+            )
 
         # Persist posts
         for post in posts_this_step:
@@ -163,6 +185,7 @@ class SimulationEngine:
             "opinion_max": max(all_opinions) if all_opinions else 0,
             "avg_shift": sum(opinion_shifts) / len(opinion_shifts) if opinion_shifts else 0,
             "total_posts": sum(s.post_count + s.reply_count for s in self.states.values()),
+            "llm_calls": llm_calls,
         }
         self.step_stats.append(stats)
 
@@ -171,6 +194,103 @@ class SimulationEngine:
             cb(stats, posts_this_step)
 
         return stats
+
+    def _split_by_priority(self, active_ids: list[str]) -> tuple[list[str], list[str]]:
+        """Split active agents into LLM and rule-based groups.
+
+        Priority for LLM: higher extraversion (more active in discussions),
+        plus agents who recently had opinion shifts or received news.
+        """
+        n_llm = max(1, int(len(active_ids) * self.config.llm_agent_ratio))
+
+        # Score agents by "discussion importance"
+        scored = []
+        for aid in active_ids:
+            profile = self.profiles[aid]
+            state = self.states[aid]
+
+            score = profile.personality.extraversion * 0.4
+            score += profile.personality.openness * 0.2
+            # Agents with strong opinions are more interesting for LLM
+            opinion = abs(state.opinions.get(self.topic_id, 0.0))
+            score += opinion * 0.2
+            # Agents with more social connections
+            n_neighbors = len(self.graph.get_neighbors(aid))
+            score += min(n_neighbors / 10.0, 0.2)
+
+            scored.append((aid, score))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+
+        llm_ids = [aid for aid, _ in scored[:n_llm]]
+        rule_ids = [aid for aid, _ in scored[n_llm:]]
+
+        return llm_ids, rule_ids
+
+    def _run_llm_batch(self, agent_ids: list[str], step_num: int) -> list:
+        """Run LLM brain for a batch of agents."""
+        from src.agents.behavior import AgentAction
+
+        agent_names = {pid: p.name for pid, p in self.profiles.items()}
+        topic_name = self.topic_id.replace("_", " ").title()
+
+        batch = []
+        for aid in agent_ids:
+            profile = self.profiles[aid]
+            state = self.states[aid]
+            feed = self.graph.get_feed(aid, step_num)
+            batch.append((profile, state, feed))
+
+        try:
+            loop = asyncio.new_event_loop()
+            actions = loop.run_until_complete(
+                self.llm_brain.think_batch(batch, topic_name, step_num, agent_names)
+            )
+            loop.close()
+            return actions
+        except Exception as e:
+            logger.error("LLM batch failed: %s, falling back to rules", e)
+            # Fallback to rule-based
+            actions = []
+            for profile, state, feed in batch:
+                action = self.behavior.decide_action(
+                    profile, state, feed, self.topic_id, step_num,
+                )
+                actions.append(action)
+            return actions
+
+    def _apply_action(
+        self,
+        agent_id: str,
+        action,
+        step_num: int,
+        posts_this_step: list[Post],
+        actions_taken: dict[str, int],
+        opinion_shifts: list[float],
+    ) -> None:
+        """Apply an agent's action to the simulation state."""
+        state = self.states[agent_id]
+        actions_taken[action.action_type.value] += 1
+
+        if action.post is not None:
+            action.post.sim_time = self.time.current
+            self.graph.add_post(action.post)
+            posts_this_step.append(action.post)
+
+            if action.action_type == ActionType.POST:
+                state.post_count += 1
+            else:
+                state.reply_count += 1
+
+        if action.opinion_deltas:
+            for topic, delta in action.opinion_deltas.items():
+                old = state.opinions.get(topic, 0.0)
+                new = max(-1.0, min(1.0, old + delta))
+                state.opinions[topic] = new
+                opinion_shifts.append(abs(delta))
+
+        if action.memory_entry:
+            state.memory = self.memory_mgr.add(state.memory, action.memory_entry)
 
     def run(self, n_steps: int) -> list[dict]:
         """Run N simulation steps."""

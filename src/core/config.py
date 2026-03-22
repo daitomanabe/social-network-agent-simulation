@@ -43,3 +43,8 @@ class SimulationConfig:
 
     # Topics
     initial_topics: list[str] = field(default_factory=lambda: ["AI regulation"])
+
+    # Hybrid mode: use LLM for top-N most active agents, rule-based for rest
+    use_llm: bool = False  # Enable LLM mode
+    llm_agent_ratio: float = 0.3  # Fraction of active agents that use LLM
+    llm_activity_threshold: float = 0.5  # Extraversion threshold for LLM priority
