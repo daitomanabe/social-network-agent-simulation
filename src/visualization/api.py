@@ -8,8 +8,12 @@ import logging
 from contextlib import asynccontextmanager
 from datetime import datetime
 
+from pathlib import Path
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from src.core.config import SimulationConfig
@@ -86,6 +90,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Static files
+_static_dir = Path(__file__).parent / "static"
+
+
+@app.get("/")
+def serve_index():
+    """Serve the web dashboard."""
+    return FileResponse(_static_dir / "index.html")
 
 
 # --- REST Endpoints ---
