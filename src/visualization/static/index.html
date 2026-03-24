@@ -25,7 +25,7 @@ body { font-family: 'Helvetica Neue', sans-serif; background: #0a0a0f; color: #e
 .header .controls button:hover { background: #2a4a7f; }
 .header .controls button.active { background: #00d4ff; color: #0a0a0f; }
 
-.dashboard { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; gap: 8px; padding: 8px; height: calc(100vh - 60px); }
+.dashboard { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr 200px; gap: 8px; padding: 8px; height: calc(100vh - 60px); }
 .panel { background: #12121f; border: 1px solid #2a2a3a; border-radius: 8px; overflow: hidden; display: flex; flex-direction: column; }
 .panel-title { padding: 10px 14px; font-size: 13px; font-weight: 600; color: #00d4ff; border-bottom: 1px solid #2a2a3a; background: #16162a; }
 .panel-body { flex: 1; padding: 10px; position: relative; overflow: auto; }
@@ -67,11 +67,16 @@ body { font-family: 'Helvetica Neue', sans-serif; background: #0a0a0f; color: #e
   <h1>🌍 Parallel World Simulator</h1>
   <div class="status" id="status">Not connected</div>
   <div class="controls">
-    <button onclick="startSim()">Start</button>
+    <select id="scenario-select" style="background:#1e3a5f;color:#00d4ff;border:1px solid #2a4a6f;padding:6px;border-radius:4px;font-size:13px">
+      <option value="">Custom Start</option>
+    </select>
+    <button onclick="startFromScenario()">Start</button>
     <button onclick="stepSim()">Step</button>
     <button onclick="runSim()">Run 10</button>
+    <button onclick="runScenario()">Run Scenario</button>
     <button onclick="stopSim()">Stop</button>
-    <button onclick="showInjectDialog()">📰 Inject News</button>
+    <button onclick="showInjectDialog()">📰 News</button>
+    <button onclick="exportReport()">📥 Export</button>
   </div>
 </div>
 
@@ -106,6 +111,11 @@ body { font-family: 'Helvetica Neue', sans-serif; background: #0a0a0f; color: #e
     <div class="panel-title">📰 Timeline & Events</div>
     <div class="panel-body" id="timeline"></div>
   </div>
+
+  <div class="panel" style="grid-column: 1 / -1">
+    <div class="panel-title">📈 Opinion Trend Over Time</div>
+    <div class="panel-body" id="trend-chart"></div>
+  </div>
 </div>
 
 <script>
@@ -124,14 +134,53 @@ async function api(path, opts = {}) {
   return res.json();
 }
 
-async function startSim() {
-  const data = await api('/api/simulation/start', {
-    method: 'POST',
-    body: JSON.stringify({ agents: 80, steps: 20, topic: 'AI regulation' }),
-  });
-  document.getElementById('status').textContent = `Initialized: ${data.agents} agents`;
+async function loadScenarios() {
+  try {
+    const data = await api('/api/scenarios');
+    const select = document.getElementById('scenario-select');
+    (data.scenarios || []).forEach(s => {
+      const opt = document.createElement('option');
+      opt.value = s.id;
+      opt.textContent = `${s.name} (${s.agents}人)`;
+      select.appendChild(opt);
+    });
+  } catch(e) {}
+}
+
+async function startFromScenario() {
+  const scenarioId = document.getElementById('scenario-select').value;
+  let data;
+  if (scenarioId) {
+    data = await api(`/api/scenarios/${scenarioId}/start`, { method: 'POST' });
+    document.getElementById('status').textContent = `Scenario: ${data.scenario} (${data.agents} agents)`;
+  } else {
+    data = await api('/api/simulation/start', {
+      method: 'POST',
+      body: JSON.stringify({ agents: 80, steps: 20, topic: 'AI regulation' }),
+    });
+    document.getElementById('status').textContent = `Initialized: ${data.agents} agents`;
+  }
   await refreshAll();
   connectWS();
+}
+
+async function startSim() { await startFromScenario(); }
+
+async function runScenario() {
+  const scenarioId = document.getElementById('scenario-select').value;
+  if (!scenarioId) { runSim(); return; }
+  api(`/api/scenarios/${scenarioId}/run?speed=0.3`, { method: 'POST' });
+}
+
+async function exportReport() {
+  try {
+    const data = await api('/api/export/json/report');
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `simulation-report-${Date.now()}.json`;
+    a.click(); URL.revokeObjectURL(url);
+  } catch(e) { alert('Start simulation first'); }
 }
 
 async function stepSim() {
@@ -192,6 +241,7 @@ async function refreshAll() {
       refreshOpinions(),
       refreshPolarization(),
       refreshTimeline(),
+      refreshTrend(),
     ]);
   } catch (e) { console.error('Refresh error:', e); }
 }
@@ -368,7 +418,82 @@ async function refreshTimeline() {
   container.innerHTML = html;
 }
 
+// --- Opinion Trend Chart ---
+async function refreshTrend() {
+  const data = await api('/api/stats');
+  const stats = data.stats || [];
+  if (stats.length < 2) {
+    document.getElementById('trend-chart').innerHTML = '<div style="color:#555;text-align:center;padding:20px">Run simulation to see trend</div>';
+    return;
+  }
+  renderTrend(stats);
+}
+
+function renderTrend(stats) {
+  const container = document.getElementById('trend-chart');
+  const existing = container.querySelector('svg');
+  if (existing) existing.remove();
+
+  const margin = { top: 10, right: 60, bottom: 25, left: 50 };
+  const w = container.clientWidth - margin.left - margin.right;
+  const h = container.clientHeight - margin.top - margin.bottom;
+  if (w < 50 || h < 30) return;
+
+  const svg = d3.select('#trend-chart').append('svg')
+    .attr('width', w + margin.left + margin.right)
+    .attr('height', h + margin.top + margin.bottom)
+    .append('g').attr('transform', `translate(${margin.left},${margin.top})`);
+
+  const x = d3.scaleLinear().domain([stats[0].step, stats[stats.length-1].step]).range([0, w]);
+  const y = d3.scaleLinear().domain([-1, 1]).range([h, 0]);
+
+  // Zero line
+  svg.append('line').attr('x1', 0).attr('x2', w).attr('y1', y(0)).attr('y2', y(0))
+    .attr('stroke', '#333').attr('stroke-dasharray', '4');
+
+  // Mean opinion line
+  const line = d3.line().x(d => x(d.step)).y(d => y(d.mean_opinion)).curve(d3.curveMonotoneX);
+  svg.append('path').datum(stats).attr('d', line)
+    .attr('fill', 'none').attr('stroke', '#00d4ff').attr('stroke-width', 2);
+
+  // Std deviation band
+  const area = d3.area()
+    .x(d => x(d.step))
+    .y0(d => y(Math.max(-1, d.mean_opinion - d.opinion_std)))
+    .y1(d => y(Math.min(1, d.mean_opinion + d.opinion_std)))
+    .curve(d3.curveMonotoneX);
+  svg.append('path').datum(stats).attr('d', area)
+    .attr('fill', '#00d4ff').attr('opacity', 0.1);
+
+  // News markers (posts > avg * 1.5 = likely news step)
+  const avgPosts = stats.reduce((s, d) => s + d.posts, 0) / stats.length;
+  stats.forEach(d => {
+    if (d.posts > avgPosts * 1.8) {
+      svg.append('line').attr('x1', x(d.step)).attr('x2', x(d.step))
+        .attr('y1', 0).attr('y2', h)
+        .attr('stroke', '#ff4444').attr('stroke-width', 1).attr('stroke-dasharray', '2');
+      svg.append('text').attr('x', x(d.step) + 3).attr('y', 12)
+        .text('📰').attr('font-size', '10px');
+    }
+  });
+
+  // Axes
+  svg.append('g').attr('transform', `translate(0,${h})`).call(d3.axisBottom(x).ticks(8).tickFormat(d => `Step ${d}`))
+    .selectAll('text').attr('fill', '#666').attr('font-size', '10px');
+  svg.selectAll('.domain,.tick line').attr('stroke', '#333');
+
+  svg.append('g').call(d3.axisLeft(y).ticks(5)).selectAll('text').attr('fill', '#666').attr('font-size', '10px');
+  svg.selectAll('.domain,.tick line').attr('stroke', '#333');
+
+  // Label
+  const last = stats[stats.length - 1];
+  svg.append('text').attr('x', x(last.step) + 4).attr('y', y(last.mean_opinion))
+    .text(`${last.mean_opinion > 0 ? '+' : ''}${last.mean_opinion.toFixed(3)}`)
+    .attr('fill', '#00d4ff').attr('font-size', '11px').attr('dominant-baseline', 'middle');
+}
+
 // Initial load
+loadScenarios();
 refreshTimeline();
 </script>
 </body>
