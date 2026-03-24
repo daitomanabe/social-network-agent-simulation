@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Parallel World Simulator</title>
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: 'Helvetica Neue', sans-serif; background: #0a0a0f; color: #e0e0e0; }
+
+.header {
+  background: linear-gradient(135deg, #1a1a2e, #16213e);
+  padding: 16px 24px;
+  display: flex; align-items: center; justify-content: space-between;
+  border-bottom: 1px solid #2a2a4a;
+}
+.header h1 { font-size: 20px; color: #00d4ff; }
+.header .status { font-size: 13px; color: #888; }
+.header .controls button {
+  background: #1e3a5f; color: #00d4ff; border: 1px solid #2a4a6f;
+  padding: 6px 14px; margin-left: 8px; border-radius: 4px; cursor: pointer;
+  font-size: 13px;
+}
+.header .controls button:hover { background: #2a4a7f; }
+.header .controls button.active { background: #00d4ff; color: #0a0a0f; }
+
+.dashboard { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; gap: 8px; padding: 8px; height: calc(100vh - 60px); }
+.panel { background: #12121f; border: 1px solid #2a2a3a; border-radius: 8px; overflow: hidden; display: flex; flex-direction: column; }
+.panel-title { padding: 10px 14px; font-size: 13px; font-weight: 600; color: #00d4ff; border-bottom: 1px solid #2a2a3a; background: #16162a; }
+.panel-body { flex: 1; padding: 10px; position: relative; overflow: auto; }
+
+/* Network graph */
+#network svg { width: 100%; height: 100%; }
+.node circle { stroke: #333; stroke-width: 1px; cursor: pointer; }
+.node text { font-size: 9px; fill: #999; pointer-events: none; }
+.link { stroke-opacity: 0.3; }
+.tooltip {
+  position: absolute; background: #1a1a2e; border: 1px solid #3a3a5a;
+  padding: 8px 12px; border-radius: 4px; font-size: 12px; pointer-events: none;
+  display: none; z-index: 10;
+}
+
+/* Opinion chart */
+.bar-label { font-size: 12px; fill: #ccc; }
+.bar-value { font-size: 11px; fill: #888; }
+
+/* Timeline */
+.timeline-entry { padding: 4px 8px; font-size: 12px; border-left: 3px solid #2a2a4a; margin-bottom: 4px; }
+.timeline-entry.news { border-color: #ff4444; background: #1a0a0a; }
+.timeline-entry.fork { border-color: #d44aff; background: #1a0a1a; }
+
+/* Polarization */
+.metric { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #1a1a2a; }
+.metric-label { color: #888; font-size: 12px; }
+.metric-value { font-size: 14px; font-weight: 600; }
+.chamber { padding: 6px 8px; margin: 4px 0; background: #1a1a28; border-radius: 4px; font-size: 12px; }
+
+.opinion-colors { display: flex; gap: 4px; font-size: 10px; padding: 4px 0; }
+.legend-item { display: flex; align-items: center; gap: 3px; }
+.legend-dot { width: 8px; height: 8px; border-radius: 50%; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>🌍 Parallel World Simulator</h1>
+  <div class="status" id="status">Not connected</div>
+  <div class="controls">
+    <button onclick="startSim()">Start</button>
+    <button onclick="stepSim()">Step</button>
+    <button onclick="runSim()">Run 10</button>
+    <button onclick="stopSim()">Stop</button>
+    <button onclick="showInjectDialog()">📰 Inject News</button>
+  </div>
+</div>
+
+<div class="dashboard">
+  <div class="panel" id="network-panel">
+    <div class="panel-title">
+      Network Graph
+      <span class="opinion-colors">
+        <span class="legend-item"><span class="legend-dot" style="background:#ff4444"></span>反対</span>
+        <span class="legend-item"><span class="legend-dot" style="background:#ffaa44"></span>やや反対</span>
+        <span class="legend-item"><span class="legend-dot" style="background:#888888"></span>中立</span>
+        <span class="legend-item"><span class="legend-dot" style="background:#44cc44"></span>やや賛成</span>
+        <span class="legend-item"><span class="legend-dot" style="background:#44ff44"></span>賛成</span>
+      </span>
+    </div>
+    <div class="panel-body" id="network">
+      <div class="tooltip" id="tooltip"></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">📊 Opinion Distribution</div>
+    <div class="panel-body" id="opinions"></div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">📈 Polarization & Echo Chambers</div>
+    <div class="panel-body" id="polarization"></div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">📰 Timeline & Events</div>
+    <div class="panel-body" id="timeline"></div>
+  </div>
+</div>
+
+<script>
+const API = '';  // Same origin
+const COLORS = ['#ff4444', '#ffaa44', '#888888', '#44cc44', '#44ff44'];
+let ws = null;
+let simulation = null;
+let graphData = null;
+
+// --- API calls ---
+async function api(path, opts = {}) {
+  const res = await fetch(API + path, {
+    headers: { 'Content-Type': 'application/json' },
+    ...opts,
+  });
+  return res.json();
+}
+
+async function startSim() {
+  const data = await api('/api/simulation/start', {
+    method: 'POST',
+    body: JSON.stringify({ agents: 80, steps: 20, topic: 'AI regulation' }),
+  });
+  document.getElementById('status').textContent = `Initialized: ${data.agents} agents`;
+  await refreshAll();
+  connectWS();
+}
+
+async function stepSim() {
+  const data = await api('/api/simulation/step', { method: 'POST' });
+  await refreshAll();
+}
+
+async function runSim() {
+  api('/api/simulation/run?steps=10&speed=0.5', { method: 'POST' });
+  // Results come via WebSocket
+}
+
+async function stopSim() {
+  await api('/api/simulation/stop', { method: 'POST' });
+}
+
+function showInjectDialog() {
+  const headline = prompt('News headline:', 'AI規制法案が国会で可決');
+  if (!headline) return;
+  const sentiment = parseFloat(prompt('Sentiment (-1 to 1):', '0.3') || '0');
+  api('/api/news/inject', {
+    method: 'POST',
+    body: JSON.stringify({ headline, sentiment, create_fork: true }),
+  }).then(() => refreshAll());
+}
+
+// --- WebSocket ---
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/ws/live`);
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'step') {
+      refreshAll();
+      updateStatus(msg.data.main);
+    } else if (msg.type === 'news_injected') {
+      addTimelineEvent('news', `📰 ${msg.data.headline}`);
+      refreshAll();
+    }
+  };
+  ws.onclose = () => {
+    document.getElementById('status').textContent = 'Disconnected';
+    setTimeout(connectWS, 3000);
+  };
+}
+
+function updateStatus(stats) {
+  if (!stats) return;
+  document.getElementById('status').textContent =
+    `Step ${stats.step} | ${stats.sim_date} | Opinion: ${stats.mean_opinion > 0 ? '+' : ''}${stats.mean_opinion.toFixed(3)}`;
+}
+
+// --- Refresh all panels ---
+async function refreshAll() {
+  try {
+    await Promise.all([
+      refreshGraph(),
+      refreshOpinions(),
+      refreshPolarization(),
+      refreshTimeline(),
+    ]);
+  } catch (e) { console.error('Refresh error:', e); }
+}
+
+// --- Network Graph ---
+async function refreshGraph() {
+  const data = await api('/api/network/graph');
+  graphData = data;
+  renderGraph(data);
+}
+
+function renderGraph(data) {
+  const container = document.getElementById('network');
+  const tooltip = document.getElementById('tooltip');
+  const existing = container.querySelector('svg');
+  if (existing) existing.remove();
+
+  const w = container.clientWidth;
+  const h = container.clientHeight;
+
+  const svg = d3.select('#network').append('svg').attr('width', w).attr('height', h);
+
+  const sim = d3.forceSimulation(data.nodes)
+    .force('link', d3.forceLink(data.links).id(d => d.id).distance(40).strength(d => d.weight * 0.5))
+    .force('charge', d3.forceManyBody().strength(-30))
+    .force('center', d3.forceCenter(w / 2, h / 2))
+    .force('collision', d3.forceCollide(8));
+
+  const link = svg.selectAll('.link')
+    .data(data.links).join('line')
+    .attr('class', 'link')
+    .attr('stroke', '#3a3a5a')
+    .attr('stroke-width', d => Math.max(0.5, d.weight * 3));
+
+  const node = svg.selectAll('.node')
+    .data(data.nodes).join('g')
+    .attr('class', 'node')
+    .call(d3.drag()
+      .on('start', (e, d) => { if (!e.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
+      .on('drag', (e, d) => { d.fx = e.x; d.fy = e.y; })
+      .on('end', (e, d) => { if (!e.active) sim.alphaTarget(0); d.fx = null; d.fy = null; })
+    );
+
+  node.append('circle')
+    .attr('r', d => 4 + Math.min(d.post_count, 10))
+    .attr('fill', d => COLORS[d.group])
+    .on('mouseover', (e, d) => {
+      tooltip.style.display = 'block';
+      tooltip.innerHTML = `<b>${d.name}</b><br>意見: ${d.opinion > 0 ? '+' : ''}${d.opinion.toFixed(2)}<br>${d.occupation} (${d.age_group})<br>投稿: ${d.post_count}`;
+    })
+    .on('mousemove', (e) => {
+      tooltip.style.left = (e.offsetX + 12) + 'px';
+      tooltip.style.top = (e.offsetY - 10) + 'px';
+    })
+    .on('mouseout', () => { tooltip.style.display = 'none'; });
+
+  sim.on('tick', () => {
+    link.attr('x1', d => d.source.x).attr('y1', d => d.source.y)
+        .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
+    node.attr('transform', d => `translate(${d.x},${d.y})`);
+  });
+}
+
+// --- Opinion Distribution ---
+async function refreshOpinions() {
+  const data = await api('/api/opinions');
+  renderOpinions(data);
+}
+
+function renderOpinions(data) {
+  const container = document.getElementById('opinions');
+  const labels = ['強く反対', '反対', '中立', '賛成', '強く賛成'];
+  const values = Object.values(data.distribution);
+  const max = Math.max(...values, 1);
+
+  let html = `<div style="margin-bottom:12px;font-size:13px">
+    Topic: <b>${data.topic}</b> | Mean: <b>${data.mean > 0 ? '+' : ''}${data.mean.toFixed(3)}</b> | Std: ${data.std.toFixed(3)}
+  </div>`;
+
+  values.forEach((v, i) => {
+    const pct = (v / max * 100).toFixed(0);
+    html += `<div style="display:flex;align-items:center;margin:6px 0">
+      <span style="width:70px;font-size:12px;color:${COLORS[i]}">${labels[i]}</span>
+      <div style="flex:1;background:#1a1a2a;height:20px;border-radius:3px;overflow:hidden">
+        <div style="width:${pct}%;height:100%;background:${COLORS[i]};transition:width 0.3s"></div>
+      </div>
+      <span style="width:30px;text-align:right;font-size:13px;margin-left:8px">${v}</span>
+    </div>`;
+  });
+
+  container.innerHTML = html;
+}
+
+// --- Polarization ---
+async function refreshPolarization() {
+  const data = await api('/api/polarization');
+  renderPolarization(data);
+}
+
+function renderPolarization(data) {
+  const container = document.getElementById('polarization');
+  const p = data.polarization;
+  const sevColor = { high: '#ff4444', moderate: '#ffaa44', low: '#44cc44' };
+
+  let html = `
+    <div class="metric">
+      <span class="metric-label">Polarization Index</span>
+      <span class="metric-value" style="color:${sevColor[data.severity]}">${p.index.toFixed(3)} (${data.severity})</span>
+    </div>
+    <div class="metric">
+      <span class="metric-label">Modularity</span>
+      <span class="metric-value">${p.modularity.toFixed(3)}</span>
+    </div>
+    <div class="metric">
+      <span class="metric-label">Cross-cluster edges</span>
+      <span class="metric-value">${(p.cross_cluster_edges * 100).toFixed(1)}%</span>
+    </div>
+    <div class="metric">
+      <span class="metric-label">Echo Chambers</span>
+      <span class="metric-value">${data.chamber_count}</span>
+    </div>
+    <div style="margin-top:8px;font-size:12px;color:#888">Chambers:</div>
+  `;
+
+  data.echo_chambers.slice(0, 5).forEach(ch => {
+    const color = ch.label === 'pro' ? '#44cc44' : ch.label === 'anti' ? '#ff4444' : '#888';
+    html += `<div class="chamber">
+      <span style="color:${color}">●</span>
+      Cluster ${ch.id}: ${ch.size} agents | opinion=${ch.mean_opinion > 0 ? '+' : ''}${ch.mean_opinion.toFixed(3)} | density=${ch.density.toFixed(2)}
+    </div>`;
+  });
+
+  container.innerHTML = html;
+}
+
+// --- Timeline ---
+let timelineEvents = [];
+
+function addTimelineEvent(type, text) {
+  timelineEvents.unshift({ type, text, time: new Date().toLocaleTimeString() });
+  if (timelineEvents.length > 30) timelineEvents.pop();
+  renderTimeline();
+}
+
+async function refreshTimeline() {
+  const data = await api('/api/status');
+  const statusText = `Step ${data.step || 0} | ${data.sim_date || '—'} | ${data.agent_count || 0} agents | ${data.total_posts || 0} posts`;
+
+  // Fetch timelines if available
+  let worldsHtml = '';
+  if (data.timelines > 1) {
+    try {
+      const tl = await api('/api/timelines');
+      for (const [id, world] of Object.entries(tl.worlds || {})) {
+        if (world.description) {
+          worldsHtml += `<div class="timeline-entry fork">🔀 ${world.description} (step ${world.fork_step || 0})</div>`;
+        }
+      }
+    } catch (e) {}
+  }
+
+  const container = document.getElementById('timeline');
+  let html = `<div style="font-size:13px;margin-bottom:8px;padding:6px;background:#16162a;border-radius:4px">${statusText}</div>`;
+  html += worldsHtml;
+
+  timelineEvents.forEach(ev => {
+    html += `<div class="timeline-entry ${ev.type}"><span style="color:#666">${ev.time}</span> ${ev.text}</div>`;
+  });
+
+  if (!timelineEvents.length && !worldsHtml) {
+    html += '<div style="color:#555;font-size:12px;padding:20px;text-align:center">Click "Start" to begin simulation</div>';
+  }
+
+  container.innerHTML = html;
+}
+
+// Initial load
+refreshTimeline();
+</script>
+</body>
+</html>
