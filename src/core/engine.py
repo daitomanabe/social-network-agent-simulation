@@ -9,6 +9,7 @@ from datetime import datetime
 
 from src.agents.behavior import RuleBasedBehavior, ActionType
 from src.agents.factory import AgentFactory
+from src.agents.history import HistoryTracker
 from src.agents.memory import MemoryManager, MemoryStream, generate_reflection_simple
 from src.agents.models import AgentProfile, AgentState
 from src.core.config import SimulationConfig
@@ -16,6 +17,7 @@ from src.core.database import Database
 from src.core.time_manager import TimeManager
 from src.network.graph import SocialGraph
 from src.network.models import Post
+from src.network.propagation import PropagationTracker
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +57,11 @@ class SimulationEngine:
 
         # Memory streams for advanced memory (agent_id -> MemoryStream)
         self.memory_streams: dict[str, MemoryStream] = {}
+
+        # History and propagation tracking
+        self.history = HistoryTracker()
+        self.propagation = PropagationTracker()
+        self._active_cascades: list[str] = []  # Currently active cascade IDs
 
         self.profiles: dict[str, AgentProfile] = {}
         self.states: dict[str, AgentState] = {}
@@ -320,11 +327,18 @@ class SimulationEngine:
             action.post.sim_time = self.time.current
             self.graph.add_post(action.post)
             posts_this_step.append(action.post)
+            self.history.record_post(action.post)
 
             if action.action_type == ActionType.POST:
                 state.post_count += 1
             else:
                 state.reply_count += 1
+
+            # Track propagation: reaction to active cascades
+            for cid in self._active_cascades:
+                self.propagation.record_reaction(
+                    cid, agent_id, step_num, post_id=action.post.id,
+                )
 
         if action.opinion_deltas:
             for topic, delta in action.opinion_deltas.items():
@@ -332,6 +346,16 @@ class SimulationEngine:
                 new = max(-1.0, min(1.0, old + delta))
                 state.opinions[topic] = new
                 opinion_shifts.append(abs(delta))
+
+                # Track opinion history
+                self.history.record_opinion(
+                    agent_id, step_num, self.time.sim_date_str,
+                    topic, new, event=action.memory_entry or "",
+                )
+
+                # Track propagation opinion shift
+                for cid in self._active_cascades:
+                    self.propagation.record_opinion_shift(cid, agent_id, step_num, old, new)
 
         if action.memory_entry:
             state.memory = self.memory_mgr.add(state.memory, action.memory_entry)
@@ -414,6 +438,20 @@ class SimulationEngine:
         )
         self.graph.add_post(post)
         self.db.insert_post(post)
+
+        # Start propagation cascade
+        cascade = self.propagation.start_cascade(
+            cascade_id=post.id,
+            headline=headline,
+            step=self.time.step,
+            sentiment=sentiment,
+            topic_id=target_topic,
+        )
+        self._active_cascades.append(post.id)
+        # Keep only last 5 active cascades
+        if len(self._active_cascades) > 5:
+            self._active_cascades.pop(0)
+
         return post
 
     def on_step_complete(self, callback) -> None:

@@ -111,12 +111,18 @@ src/
 | Timeline forking (parallel worlds) | ✅ |
 | Reality Diff (prediction accuracy) | ✅ |
 | Rich CLI dashboard | ✅ |
-| FastAPI + WebSocket API (19 endpoints) | ✅ |
-| D3.js web dashboard (network graph, real-time) | ✅ |
+| FastAPI + WebSocket API (28 endpoints) | ✅ |
+| D3.js web dashboard (network, trends, real-time) | ✅ |
 | Automated news scheduling (RSS polling) | ✅ |
 | Echo chamber detection + polarization metrics | ✅ |
 | Network evolution (homophily rewiring) | ✅ |
 | Advanced memory (reflections, weighted retrieval) | ✅ |
+| Information propagation tracking (cascades) | ✅ |
+| Agent opinion history + conversation threads | ✅ |
+| 4 pre-built scenario presets | ✅ |
+| Data export (CSV/JSON) | ✅ |
+| WorldRunner (continuous orchestration) | ✅ |
+| 5-act interactive demo script | ✅ |
 
 ## Tech Stack
 

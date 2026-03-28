@@ -468,6 +468,165 @@ def evolve_network():
     return {"changes": changes}
 
 
+@app.get("/api/scenarios")
+def list_scenarios_endpoint():
+    """List available simulation scenarios."""
+    from src.core.scenarios import list_scenarios
+    return {"scenarios": list_scenarios()}
+
+
+@app.post("/api/scenarios/{scenario_id}/start")
+def start_scenario(scenario_id: str):
+    """Initialize simulation from a pre-built scenario."""
+    global _engine, _pw_engine, _tm
+
+    from src.core.scenarios import get_scenario
+    scenario = get_scenario(scenario_id)
+
+    config = SimulationConfig(
+        agent_count=scenario.agent_count,
+        seed=scenario.seed,
+        initial_topics=scenario.topics,
+    )
+
+    _engine = SimulationEngine(config=config, start_time=datetime(2026, 3, 22))
+    _engine.initialize()
+    _engine.enable_network_evolution = True
+
+    _tm = TimelineManager(_engine.db)
+    _pw_engine = ParallelWorldEngine(_engine, _tm)
+
+    return {
+        "status": "initialized",
+        "scenario": scenario.name,
+        "agents": len(_engine.profiles),
+        "steps": scenario.total_steps,
+        "news_events": len(scenario.news_events),
+        "acts": scenario.acts,
+    }
+
+
+@app.post("/api/scenarios/{scenario_id}/run")
+async def run_scenario(scenario_id: str, speed: float = 0.5):
+    """Run a complete scenario with timed news events."""
+    global _running
+
+    from src.core.scenarios import get_scenario
+    pw = _get_pw()
+    engine = _get_engine()
+    scenario = get_scenario(scenario_id)
+
+    _running = True
+    results = []
+
+    for step_i in range(1, scenario.total_steps + 1):
+        if not _running:
+            break
+
+        # Check for scheduled news
+        for news in scenario.news_events:
+            if news.step == engine.time.step + 1:
+                pw.inject_news_with_fork(
+                    news.headline, news.summary, news.sentiment,
+                    create_counterfactual=news.create_fork,
+                )
+                await _broadcast({
+                    "type": "news_injected",
+                    "data": {"headline": news.headline, "step": news.step},
+                })
+
+        result = pw.step_all()
+        results.append(result)
+        await _broadcast({"type": "step", "data": result})
+
+        if speed > 0:
+            await asyncio.sleep(speed)
+
+    _running = False
+    return {
+        "completed": len(results),
+        "final": results[-1] if results else None,
+    }
+
+
+@app.get("/api/propagation")
+def get_propagation():
+    """Get all propagation cascade summaries."""
+    engine = _get_engine()
+    return {"cascades": engine.propagation.get_all_summaries()}
+
+
+@app.get("/api/propagation/{cascade_id}")
+def get_cascade(cascade_id: str):
+    """Get detailed propagation cascade."""
+    engine = _get_engine()
+    summary = engine.propagation.get_cascade_summary(cascade_id)
+    if not summary:
+        return {"error": "Cascade not found"}
+    summary["influential_agents"] = engine.propagation.get_most_influential_agents(cascade_id)
+    return summary
+
+
+@app.get("/api/history/{agent_id}")
+def get_agent_history(agent_id: str, topic_id: str | None = None):
+    """Get an agent's opinion history timeline."""
+    engine = _get_engine()
+    timeline = engine.history.get_agent_timeline(agent_id, topic_id)
+    return {
+        "agent_id": agent_id,
+        "timeline": timeline,
+        "total_snapshots": len(timeline),
+    }
+
+
+@app.get("/api/history/most-changed")
+def get_most_changed():
+    """Get agents whose opinions changed the most."""
+    engine = _get_engine()
+    return {"agents": engine.history.get_most_changed_agents(engine.topic_id)}
+
+
+@app.get("/api/threads")
+def get_threads(top_n: int = 10):
+    """Get longest conversation threads."""
+    engine = _get_engine()
+    return {
+        "threads": engine.history.get_longest_threads(top_n),
+        "stats": engine.history.get_stats(),
+    }
+
+
+@app.get("/api/export/csv/stats")
+def export_stats_csv():
+    """Export step statistics as CSV."""
+    from fastapi.responses import PlainTextResponse
+    from src.core.export import DataExporter
+    engine = _get_engine()
+    csv_data = DataExporter.step_stats_to_csv(engine.step_stats)
+    return PlainTextResponse(csv_data, media_type="text/csv",
+                            headers={"Content-Disposition": "attachment; filename=stats.csv"})
+
+
+@app.get("/api/export/csv/opinions")
+def export_opinions_csv():
+    """Export agent opinions as CSV."""
+    from fastapi.responses import PlainTextResponse
+    from src.core.export import DataExporter
+    engine = _get_engine()
+    csv_data = DataExporter.agent_opinions_to_csv(engine.profiles, engine.states, engine.topic_ids)
+    return PlainTextResponse(csv_data, media_type="text/csv",
+                            headers={"Content-Disposition": "attachment; filename=opinions.csv"})
+
+
+@app.get("/api/export/json/report")
+def export_full_report():
+    """Export comprehensive simulation report as JSON."""
+    from src.core.export import DataExporter
+    engine = _get_engine()
+    report = DataExporter.full_report_json(engine, _pw_engine, engine.dynamics)
+    return json.loads(report)
+
+
 def _opinion_group(opinion: float) -> int:
     """Map opinion to a group index for visualization coloring."""
     if opinion < -0.6:
